@@ -14,6 +14,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://js.paystack.co/v1/inline.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -1317,84 +1318,52 @@ function Captcha({ code, onRefresh }) {
 // ---------- ACCOUNTS (real local registration/login) ----------
 // Separate from the single app `store` \u2014 this is a registry of every
 // account created on this device, so registration and login actually
-// mean something instead of any input logging in immediately.
-//
-// HONEST LIMITATION: this still only exists in this browser's
-// localStorage. Passwords are hashed (not stored in plain text) but
-// with a simple non-cryptographic hash \u2014 adequate to stop casual
-// inspection, not real security. Two different real people on two
-// different real phones have two completely separate account
-// registries; nothing here is shared between devices. Replace this
-// whole section with real Supabase Auth (supabase.auth.signUp /
-// signInWithPassword) once the backend exists \u2014 it already handles
-// proper password hashing, sessions, and works across devices.
-const ACCOUNTS_KEY = "reaplyst_accounts_v1";
+const ACCOUNTS_KEY = "reaplyst_accounts_v1"; // unused now — kept only so old saved data doesn't crash old code paths
 
-function loadAccounts() {
-  try {
-    const raw = window.localStorage.getItem(ACCOUNTS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function saveAccounts(accounts) {
-  try {
-    window.localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
-  } catch (e) {
-    // storage unavailable — registration/login simply won't persist
-  }
-}
-
-// Simple non-cryptographic hash so passwords aren't sitting in plain
-// text in localStorage. NOT secure against a determined attacker with
-// access to this device — real password hashing (bcrypt/argon2) happens
-// server-side once Supabase Auth replaces this.
-function simpleHash(str) {
-  let h = 5381;
-  for (let i = 0; i < str.length; i++) {
-    h = ((h << 5) + h + str.charCodeAt(i)) | 0;
-  }
-  return (h >>> 0).toString(36);
-}
+// ---------- SUPABASE ----------
+const SUPABASE_URL = "https://agesfadvugwytdqrlszb.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_YVM5x6VrRagTWGIQ9UQ_Og_WeKECvSb";
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "");
 }
 
-// A stable, real per-account display ID, derived from the phone number
-// instead of a hardcoded placeholder \u2014 same account always shows the
-// same ID, different accounts show different ones. Once Supabase exists,
-// swap this for the real database row ID instead.
-function accountDisplayId(phone) {
-  if (!phone) return "------";
-  return simpleHash(normalizePhone(phone)).toUpperCase().padStart(6, "0").slice(0, 6);
+// Supabase phone auth expects E.164 format (e.g. +2348012345678).
+// Adjust the country code below if Reaplyst's users aren't Nigerian-only.
+function toE164(rawPhone) {
+  const digits = normalizePhone(rawPhone);
+  if (digits.startsWith("234")) return `+${digits}`;
+  if (digits.startsWith("0")) return `+234${digits.slice(1)}`;
+  return `+234${digits}`;
 }
 
-function findAccount(phone) {
-  const norm = normalizePhone(phone);
-  return loadAccounts().find(a => a.phone === norm) || null;
+async function registerAccount(phone, password, email) {
+  const { data, error } = await supabase.auth.signUp({
+    phone: toE164(phone),
+    password,
+    options: { data: { email: email || "" } },
+  });
+  if (error) return { ok: false, error: error.message };
+  return { ok: true, account: data.user };
 }
 
-function registerAccount(phone, password, email) {
-  const norm = normalizePhone(phone);
-  const accounts = loadAccounts();
-  if (accounts.some(a => a.phone === norm)) {
-    return { ok: false, error: "An account with this phone number already exists." };
-  }
-  const account = { phone: norm, email: email || "", passwordHash: simpleHash(password), createdAt: nowISO() };
-  saveAccounts([...accounts, account]);
-  return { ok: true, account };
+async function checkLogin(phone, password) {
+  const { data, error } = await supabase.auth.signInWithPassword({
+    phone: toE164(phone),
+    password,
+  });
+  if (error) return { ok: false, error: error.message };
+  return { ok: true, account: data.user };
 }
 
-function checkLogin(phone, password) {
-  const account = findAccount(phone);
-  if (!account) return { ok: false, error: "No account found with this phone number." };
-  if (account.passwordHash !== simpleHash(password)) {
-    return { ok: false, error: "Incorrect password." };
-  }
-  return { ok: true, account };
+async function getCurrentSession() {
+  const { data } = await supabase.auth.getSession();
+  return data.session;
+}
+
+async function signOutAccount() {
+  await supabase.auth.signOut();
 }
 
 
@@ -1416,7 +1385,7 @@ function Auth({ mode, setMode, onLogin }) {
     if (error) setError("");
   }
 
-  function submit() {
+  async function submit() {
     const normPhone = normalizePhone(phone);
     if (normPhone.length < 10) {
       setError("Enter a valid phone number.");
@@ -1436,8 +1405,9 @@ function Auth({ mode, setMode, onLogin }) {
       return;
     }
 
+    setError("");
     if (mode === "register") {
-      const result = registerAccount(phone, password, email.trim());
+      const result = await registerAccount(phone, password, email.trim());
       if (!result.ok) {
         setError(result.error);
         refreshCaptcha();
@@ -1445,13 +1415,13 @@ function Auth({ mode, setMode, onLogin }) {
       }
       onLogin(normPhone, email.trim(), referralInput.trim() || null);
     } else {
-      const result = checkLogin(phone, password);
+      const result = await checkLogin(phone, password);
       if (!result.ok) {
         setError(result.error);
         refreshCaptcha();
         return;
       }
-      onLogin(normPhone, result.account.email || "", null);
+      onLogin(normPhone, result.account?.user_metadata?.email || "", null);
     }
   }
 
