@@ -1323,7 +1323,14 @@ const ACCOUNTS_KEY = "reaplyst_accounts_v1"; // unused now — kept only so old 
 // ---------- SUPABASE ----------
 const SUPABASE_URL = "https://agesfadvugwytdqrlszb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_YVM5x6VrRagTWGIQ9UQ_Og_WeKECvSb";
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+let supabase = null;
+try {
+  if (window.supabase && window.supabase.createClient) {
+    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }
+} catch(e) {
+  console.warn("Supabase failed to init:", e);
+}
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "");
@@ -1339,6 +1346,7 @@ function toE164(rawPhone) {
 }
 
 async function registerAccount(phone, password, email) {
+  if (!supabase) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
   const { data, error } = await supabase.auth.signUp({
     phone: toE164(phone),
     password,
@@ -1349,6 +1357,7 @@ async function registerAccount(phone, password, email) {
 }
 
 async function checkLogin(phone, password) {
+  if (!supabase) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
   const { data, error } = await supabase.auth.signInWithPassword({
     phone: toE164(phone),
     password,
@@ -1358,11 +1367,13 @@ async function checkLogin(phone, password) {
 }
 
 async function getCurrentSession() {
+  if (!supabase) return null;
   const { data } = await supabase.auth.getSession();
   return data.session;
 }
 
 async function signOutAccount() {
+  if (!supabase) return;
   await supabase.auth.signOut();
 }
 
