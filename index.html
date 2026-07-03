@@ -14,7 +14,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://js.paystack.co/v1/inline.js"></script>
-<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -1331,14 +1330,30 @@ const ACCOUNTS_KEY = "reaplyst_accounts_v1"; // unused now — kept only so old 
 const SUPABASE_URL = "https://agesfadvugwytdqrlszb.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_YVM5x6VrRagTWGIQ9UQ_Og_WeKECvSb";
 let supabase = null;
-try {
-  // unpkg UMD build exposes createClient directly on window.supabase
-  const sb = window.supabase || window.Supabase;
-  if (sb && sb.createClient) {
-    supabase = sb.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  }
-} catch(e) {
-  console.warn("Supabase failed to init:", e);
+
+// Load Supabase dynamically AFTER React renders — so a slow/failed CDN
+// never causes a blank page. Auth calls will wait until it's ready.
+function loadSupabase() {
+  return new Promise((resolve) => {
+    if (supabase) return resolve(supabase);
+    if (window.supabase && window.supabase.createClient) {
+      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      return resolve(supabase);
+    }
+    const script = document.createElement("script");
+    script.src = "https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js";
+    script.onload = () => {
+      try {
+        const sb = window.supabase || window.Supabase;
+        if (sb && sb.createClient) {
+          supabase = sb.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        }
+      } catch(e) { console.warn("Supabase init failed:", e); }
+      resolve(supabase);
+    };
+    script.onerror = () => resolve(null);
+    document.head.appendChild(script);
+  });
 }
 
 function normalizePhone(phone) {
@@ -1355,8 +1370,9 @@ function toE164(rawPhone) {
 }
 
 async function registerAccount(phone, password, email) {
-  if (!supabase) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
-  const { data, error } = await supabase.auth.signUp({
+  const sb = await loadSupabase();
+  if (!sb) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
+  const { data, error } = await sb.auth.signUp({
     phone: toE164(phone),
     password,
     options: { data: { email: email || "" } },
@@ -1366,8 +1382,9 @@ async function registerAccount(phone, password, email) {
 }
 
 async function checkLogin(phone, password) {
-  if (!supabase) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
-  const { data, error } = await supabase.auth.signInWithPassword({
+  const sb = await loadSupabase();
+  if (!sb) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
+  const { data, error } = await sb.auth.signInWithPassword({
     phone: toE164(phone),
     password,
   });
@@ -1376,14 +1393,16 @@ async function checkLogin(phone, password) {
 }
 
 async function getCurrentSession() {
-  if (!supabase) return null;
-  const { data } = await supabase.auth.getSession();
+  const sb = await loadSupabase();
+  if (!sb) return null;
+  const { data } = await sb.auth.getSession();
   return data.session;
 }
 
 async function signOutAccount() {
-  if (!supabase) return;
-  await supabase.auth.signOut();
+  const sb = await loadSupabase();
+  if (!sb) return;
+  await sb.auth.signOut();
 }
 
 
