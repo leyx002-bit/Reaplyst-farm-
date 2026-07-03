@@ -1323,86 +1323,117 @@ function Captcha({ code, onRefresh }) {
 
 // ---------- ACCOUNTS (real local registration/login) ----------
 // Separate from the single app `store` \u2014 this is a registry of every
-// account created on this device, so registration and login actually
-const ACCOUNTS_KEY = "reaplyst_accounts_v1"; // unused now — kept only so old saved data doesn't crash old code paths
+// account created on this device. Registration and login are checked
+// for real against this list (no bypass, no "log in anyway"): a call
+// either finds a valid match and grants access, or it doesn't and
+// access is denied with an error, the same shape a real server-backed
+// auth call would return.
+//
+// HONEST LIMITATION: this list lives in this browser's localStorage, so
+// it's private to one device. There's no server, so an account made
+// here can't log in from a different phone/browser. Swap
+// loadAccounts/saveAccounts for real API calls once a backend exists;
+// registerAccount/checkLogin's call sites won't need to change.
+const ACCOUNTS_KEY = "reaplyst_accounts_v1";
 
-// ---------- SUPABASE ----------
-const SUPABASE_URL = "https://agesfadvugwytdqrlszb.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_YVM5x6VrRagTWGIQ9UQ_Og_WeKECvSb";
-let supabase = null;
+// Anti-abuse cap: at most this many accounts may be registered from one
+// device/browser. Registration is refused (not silently ignored) once
+// the cap is hit; login is unaffected \u2014 existing accounts on this
+// device can still log in normally, this only blocks creating a 3rd+.
+const MAX_ACCOUNTS_PER_DEVICE = 2;
 
-// Load Supabase dynamically AFTER React renders — so a slow/failed CDN
-// never causes a blank page. Auth calls will wait until it's ready.
-function loadSupabase() {
-  return new Promise((resolve) => {
-    if (supabase) return resolve(supabase);
-    if (window.supabase && window.supabase.createClient) {
-      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      return resolve(supabase);
-    }
-    const script = document.createElement("script");
-    script.src = "https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js";
-    script.onload = () => {
-      try {
-        const sb = window.supabase || window.Supabase;
-        if (sb && sb.createClient) {
-          supabase = sb.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-        }
-      } catch(e) { console.warn("Supabase init failed:", e); }
-      resolve(supabase);
-    };
-    script.onerror = () => resolve(null);
-    document.head.appendChild(script);
-  });
+function loadAccounts() {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveAccounts(accounts) {
+  try {
+    window.localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
+  } catch (e) {
+    // storage unavailable (private mode, quota, etc) — fail silently,
+    // the current session still works, it just won't persist
+  }
 }
 
 function normalizePhone(phone) {
   return phone.replace(/\D/g, "");
 }
 
-// Supabase phone auth expects E.164 format (e.g. +2348012345678).
-// Adjust the country code below if Reaplyst's users aren't Nigerian-only.
-function toE164(rawPhone) {
-  const digits = normalizePhone(rawPhone);
-  if (digits.startsWith("234")) return `+${digits}`;
-  if (digits.startsWith("0")) return `+234${digits.slice(1)}`;
-  return `+234${digits}`;
+// General international phone check (not Nigeria-specific): after
+// stripping everything but digits, a real phone number is 7\u201315 digits
+// long \u2014 that's the ITU-T E.164 range every country's numbers fall
+// within, whether or not the person typed a leading + or country code.
+// This intentionally doesn't try to validate a specific country's
+// prefixes/length, since those rules differ by country; it just filters
+// out obviously-wrong input (too short, letters, etc).
+function isValidPhone(normPhone) {
+  return /^\d{7,15}$/.test(normPhone);
+}
+
+// Deliberately NOT real security \u2014 there's no server here to keep a
+// secret on, so nothing client-side can be. This just keeps raw
+// passwords from sitting in localStorage as plain text. Replace with
+// real server-side hashing (bcrypt/argon2 behind HTTPS) once a backend
+// exists; that's the only place password storage can be done safely.
+function hashPassword(password) {
+  let h = 5381;
+  for (let i = 0; i < password.length; i++) {
+    h = ((h * 33) ^ password.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
 }
 
 async function registerAccount(phone, password, email) {
-  const sb = await loadSupabase();
-  if (!sb) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
-  const { data, error } = await sb.auth.signUp({
-    phone: toE164(phone),
-    password,
-    options: { data: { email: email || "" } },
-  });
-  if (error) return { ok: false, error: error.message };
-  return { ok: true, account: data.user };
+  const normPhone = normalizePhone(phone);
+  const accounts = loadAccounts();
+
+  if (accounts.some(a => a.phone === normPhone)) {
+    return { ok: false, error: "An account with this phone number already exists on this device." };
+  }
+  if (accounts.length >= MAX_ACCOUNTS_PER_DEVICE) {
+    return { ok: false, error: `This device already has ${MAX_ACCOUNTS_PER_DEVICE} accounts \u2014 that's the limit per device.` };
+  }
+
+  const account = {
+    phone: normPhone,
+    passwordHash: hashPassword(password),
+    email: email || "",
+    createdAt: nowISO(),
+  };
+  accounts.push(account);
+  saveAccounts(accounts);
+  return { ok: true, account };
 }
 
+// Real gate, not a formality: only an existing account whose stored
+// hash matches the entered password is granted access. Anything else
+// (unknown phone, wrong password) is denied with the same generic
+// message, so a wrong guess can't be used to probe which phones are
+// registered on this device.
 async function checkLogin(phone, password) {
-  const sb = await loadSupabase();
-  if (!sb) return { ok: false, error: "Connection unavailable. Check your internet and reload." };
-  const { data, error } = await sb.auth.signInWithPassword({
-    phone: toE164(phone),
-    password,
-  });
-  if (error) return { ok: false, error: error.message };
-  return { ok: true, account: data.user };
+  const normPhone = normalizePhone(phone);
+  const accounts = loadAccounts();
+  const account = accounts.find(a => a.phone === normPhone);
+  const granted = !!account && account.passwordHash === hashPassword(password);
+
+  if (granted) return { ok: true, account };
+  return { ok: false, error: "Incorrect phone number or password." };
 }
 
 async function getCurrentSession() {
-  const sb = await loadSupabase();
-  if (!sb) return null;
-  const { data } = await sb.auth.getSession();
-  return data.session;
+  return null; // no persistent token here — Reaplyst() re-checks the `authed` flag it already saved in loadState()
 }
 
 async function signOutAccount() {
-  const sb = await loadSupabase();
-  if (!sb) return;
-  await sb.auth.signOut();
+  // no-op: logging out just flips `authed` to false in app state (see the
+  // Log out button) — the account itself stays registered on this device
 }
 
 
@@ -1426,7 +1457,7 @@ function Auth({ mode, setMode, onLogin }) {
 
   async function submit() {
     const normPhone = normalizePhone(phone);
-    if (normPhone.length < 10) {
+    if (!isValidPhone(normPhone)) {
       setError("Enter a valid phone number.");
       return;
     }
@@ -1460,7 +1491,7 @@ function Auth({ mode, setMode, onLogin }) {
         refreshCaptcha();
         return;
       }
-      onLogin(normPhone, result.account?.user_metadata?.email || "", null);
+      onLogin(normPhone, result.account?.email || "", null);
     }
   }
 
