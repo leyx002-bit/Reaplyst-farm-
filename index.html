@@ -3,7 +3,44 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Reaplyst</title>
+<title>Reaplyst | Agricultural Marketplace</title>
+<meta name="description" content="Discover Reaplyst, an agricultural marketplace for exploring farm products and opportunities." />
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+<meta name="googlebot" content="index, follow, max-image-preview:large" />
+<meta name="theme-color" content="#0F2247" />
+<meta name="application-name" content="Reaplyst" />
+<meta name="author" content="Reaplyst" />
+<meta name="keywords" content="Reaplyst, agriculture, farm products, agricultural marketplace, farming" />
+<link rel="canonical" href="https://reaplyst.vercel.app/" />
+<link rel="icon" type="image/jpeg" href="https://reaplyst.vercel.app/images/logo1.jpg" />
+<link rel="apple-touch-icon" href="https://reaplyst.vercel.app/images/logo1.jpg" />
+
+<!-- Open Graph: link previews on WhatsApp, Facebook, LinkedIn and other platforms -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Reaplyst" />
+<meta property="og:title" content="Reaplyst | Agricultural Marketplace" />
+<meta property="og:description" content="Discover Reaplyst, an agricultural marketplace for exploring farm products and opportunities." />
+<meta property="og:url" content="https://reaplyst.vercel.app/" />
+<meta property="og:image" content="https://reaplyst.vercel.app/images/logo1.jpg" />
+<meta property="og:image:alt" content="Reaplyst brand logo" />
+<meta property="og:image:type" content="image/jpeg" />
+
+<!-- Twitter/X link preview -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Reaplyst | Agricultural Marketplace" />
+<meta name="twitter:description" content="Discover Reaplyst, an agricultural marketplace for exploring farm products and opportunities." />
+<meta name="twitter:image" content="https://reaplyst.vercel.app/images/logo1.jpg" />
+
+<!-- Structured data: website identity -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Reaplyst",
+  "url": "https://reaplyst.vercel.app/",
+  "description": "An agricultural marketplace for exploring farm products and opportunities."
+}
+</script>
 <style>
   html, body { margin: 0; padding: 0; background: #E8EEF8; }
   * { box-sizing: border-box; }
@@ -364,7 +401,8 @@ function lastDayOfMonth(year, monthIndex) {
 
 function isWithdrawalDay(d = new Date()) {
   const target = Math.min(30, lastDayOfMonth(d.getFullYear(), d.getMonth()));
-  return d.getDate() === target;
+  // Window opens at 11 PM (23:00) and closes at midnight (00:00 next day)
+  return d.getDate() === target && d.getHours() === 23;
 }
 
 // Returns a Date for the next upcoming withdrawal day, used to tell the
@@ -1495,7 +1533,7 @@ async function submitWithdrawalToSupabase(amount, bankDetails) {
   const day = today.getDate();
   const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
   if (day !== 30 && day !== lastDay) {
-    return { ok: false, error: "Withdrawals open on the 30th only. Next: " + nextWithdrawalDate() };
+    return { ok: false, error: "Withdrawal window is 11 PM–midnight on the 30th only. Next: " + nextWithdrawalDate() };
   }
 
   const { data: balRow } = await _supabase.from("balances").select("balance").eq("id", user.id).single();
@@ -1672,6 +1710,8 @@ function Withdraw({ onBack, balance, onWithdraw }) {
   const insufficient = numeric > 0 && numeric > balance;
   const today = new Date();
   const windowOpen = isWithdrawalDay(today);
+  const isThe30th = today.getDate() === Math.min(30, new Date(today.getFullYear(), today.getMonth()+1, 0).getDate());
+  const pastCutoff = false; // window is only 11 PM–midnight, handled by isWithdrawalDay
   const nextDate = nextWithdrawalDate(today);
   const blocked = !windowOpen;
 
@@ -1687,7 +1727,22 @@ function Withdraw({ onBack, balance, onWithdraw }) {
           <div style={{ fontFamily: "system-ui, -apple-system, sans-serif", fontSize: 24, marginTop: 4 }}>{fmt(balance)}</div>
         </div>
 
-        {blocked && (
+        {pastCutoff && (
+          <div style={{
+            background: "#FEF2F2", border: `1px solid #FECACA`, borderRadius: 12,
+            padding: "14px 16px", marginBottom: 18,
+          }}>
+            <div style={{ fontSize: 13.5, color: "#991B1B", fontWeight: 700, marginBottom: 4 }}>
+              Withdrawal window closed
+            </div>
+            <div style={{ fontSize: 12.5, color: C.inkSoft, lineHeight: 1.5 }}>
+              The withdrawal window closes at <strong style={{ color: C.ink }}>11 PM</strong> on the 30th.
+              The window has closed for this month. Next withdrawal day is{" "}
+              <strong style={{ color: C.ink }}>{fmtDateLong(nextWithdrawalDate(new Date(today.getFullYear(), today.getMonth()+1, 1)))}</strong>.
+            </div>
+          </div>
+        )}
+        {blocked && !pastCutoff && (
           <div style={{
             background: "#EFF6FF", border: `1px solid ${C.line}`, borderRadius: 12,
             padding: "14px 16px", marginBottom: 18,
@@ -1696,9 +1751,10 @@ function Withdraw({ onBack, balance, onWithdraw }) {
               Withdrawals open on the 30th
             </div>
             <div style={{ fontSize: 12.5, color: C.inkSoft, lineHeight: 1.5 }}>
-              Withdrawal requests are processed once a month, on the 30th (or the last day of
-              shorter months). The window isn&rsquo;t open today &mdash; the next withdrawal day is{" "}
-              <strong style={{ color: C.ink }}>{fmtDateLong(nextDate)}</strong>.
+              Withdrawal requests are processed once a month. The window opens at{" "}
+              <strong style={{ color: C.ink }}>11 PM</strong> on the 30th and closes at{" "}
+              <strong style={{ color: C.ink }}>midnight</strong> — a one-hour window.
+              Next withdrawal date: <strong style={{ color: C.ink }}>{fmtDateLong(nextDate)}</strong>.
             </div>
           </div>
         )}
