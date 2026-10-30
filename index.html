@@ -1028,7 +1028,7 @@ function MyPage({ onNav, balance, userId, phone, unreadCount = 0 }) {
 // payments. Test keys start with pk_test_, live keys with pk_live_.
 const PAYSTACK_PUBLIC_KEY = "pk_live_3919642124f9288ad1035a0043e24d8efab7ed19";
 
-function openPaystackCheckout({ email, amountKobo, onSuccess, onClose }) {
+function openPaystackCheckout({ email, amountKobo, reference, onSuccess, onClose }) {
   if (typeof window.PaystackPop === "undefined") {
     onClose && onClose("Paystack script hasn't loaded yet \u2014 check your internet connection and try again.");
     return;
@@ -1038,6 +1038,7 @@ function openPaystackCheckout({ email, amountKobo, onSuccess, onClose }) {
     email,
     amount: amountKobo, // Paystack expects kobo (Naira \u00d7 100)
     currency: "NGN",
+    ref: reference, // our own reference, already saved in the recharges table
     callback: function (response) {
       // response.reference proves the popup completed, but this still runs
       // in the user's browser \u2014 it is NOT proof the payment is real.
@@ -1073,15 +1074,25 @@ function Recharge({ onBack, balance, email, onPendingRecharge }) {
     setAmt(Number(cleaned) || 0);
   }
 
-  function startPayment() {
-    if (!canPay) return;
+  async function startPayment() {
+    if (!canPay || stage === "opening") return;
     setStage("opening");
+    // Create our own reference and save the pending row BEFORE the popup opens,
+    // so the webhook can always find it when Paystack confirms the payment.
+    const reference = "RCG" + Date.now() + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const saved = await savePendingRecharge(amt, reference);
+    if (!saved) {
+      setStage("idle");
+      window.alert("Couldn't start the payment. Check your internet connection and try again.");
+      return;
+    }
     openPaystackCheckout({
       email,
       amountKobo: Math.round(amt * 100),
-      onSuccess: (reference) => {
+      reference,
+      onSuccess: (ref) => {
         setStage("pending");
-        onPendingRecharge(amt, reference);
+        onPendingRecharge(amt, ref);
       },
       onClose: (errorMsg) => {
         setStage("idle");
@@ -1434,10 +1445,12 @@ async function loadUserDataFromSupabase() {
 
 async function savePendingRecharge(amount, reference) {
   const { data: { user } } = await _supabase.auth.getUser();
-  if (!user) return;
-  await _supabase.from("recharges").insert({
+  if (!user) return false;
+  const { error } = await _supabase.from("recharges").insert({
     user_id: user.id, amount, reference, status: "pending", created_at: nowISO(),
   });
+  if (error) { console.error("savePendingRecharge failed:", error); return false; }
+  return true;
 }
 
 async function savePurchaseToSupabase(holding) {
@@ -2325,7 +2338,6 @@ function Reaplyst() {
     if (!amount || amount <= 0) return;
     const record = { id: newId(), amount, at: nowISO(), method: "Paystack", status: "Pending", reference };
     setStore(s => ({ ...s, recharges: [...s.recharges, record] }));
-    savePendingRecharge(amount, reference); // save to Supabase
     showToast("Payment received \u2014 confirming with Paystack\u2026");
   }
 
