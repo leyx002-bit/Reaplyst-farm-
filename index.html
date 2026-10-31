@@ -367,6 +367,14 @@ function accountDisplayId(phone) {
 // yield. Change the amount here, nowhere else.
 const REFERRAL_BONUS = 500;
 
+// Derive a friendly display name from an email address when the user
+// hasn't set a real name yet. e.g. "john@gmail.com" → "John"
+function nameFromEmail(email) {
+  if (!email) return "User";
+  const local = email.split("@")[0].replace(/[._\-+]/g, " ").trim();
+  return local.charAt(0).toUpperCase() + local.slice(1);
+}
+
 // One-time flat bonus credited the moment a user's FIRST purchase
 // completes \u2014 a real, fixed thank-you for trying the platform, not a
 // return on the purchase itself and not repeated on later purchases.
@@ -1395,7 +1403,7 @@ function phoneToEmail(normPhone) {
   return normPhone + "@reaplyst.app";
 }
 
-async function registerAccount(phone, password, email) {
+async function registerAccount(phone, password, email, fullName) {
   const normPhone = normalizePhone(phone);
   const fakeEmail = phoneToEmail(normPhone);
 
@@ -1416,7 +1424,7 @@ async function registerAccount(phone, password, email) {
   if (uid) {
     await _supabase.from("profiles").upsert({
       id: uid, phone: normPhone, email: email || "",
-      referral_code: generateReferralCode(), created_at: nowISO(),
+      name: fullName || "", referral_code: generateReferralCode(), created_at: nowISO(),
     });
     await _supabase.from("balances").upsert({ id: uid, balance: 0 });
   }
@@ -1578,7 +1586,7 @@ async function submitWithdrawalToSupabase(amount, bankInfo) {
 
   // Notify admin via Telegram
   const { data: profile } = await _supabase.from("profiles").select("name, phone").eq("id", user.id).single();
-  const userName = profile?.name || "Unknown";
+  const userName = profile?.name || nameFromEmail(user.email);
   const userPhone = profile?.phone || user.email || "";
   const typeLabel = isReferral ? "🎁 REFERRAL BONUS" : "💸 NORMAL WITHDRAWAL";
   await sendTelegramAlert(
@@ -1600,6 +1608,7 @@ ID: ${wRow?.id || "—"}
 
 function Auth({ mode, setMode, onLogin }) {
   const [phone, setPhone] = useState("");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [referralInput, setReferralInput] = useState("");
@@ -1622,6 +1631,10 @@ function Auth({ mode, setMode, onLogin }) {
       setError("Enter a valid phone number.");
       return;
     }
+    if (mode === "register" && fullName.trim().length < 2) {
+      setError("Enter your full name.");
+      return;
+    }
     if (mode === "register" && !/^\S+@\S+\.\S+$/.test(email.trim())) {
       setError("Enter a valid email address \u2014 Paystack uses this for receipts.");
       return;
@@ -1638,13 +1651,13 @@ function Auth({ mode, setMode, onLogin }) {
 
     setError("");
     if (mode === "register") {
-      const result = await registerAccount(phone, password, email.trim());
+      const result = await registerAccount(phone, password, email.trim(), fullName.trim());
       if (!result.ok) {
         setError(result.error);
         refreshCaptcha();
         return;
       }
-      onLogin(normPhone, email.trim(), referralInput.trim() || null);
+      onLogin(normPhone, email.trim(), referralInput.trim() || null, fullName.trim());
     } else {
       const result = await checkLogin(phone, password);
       if (!result.ok) {
@@ -1687,6 +1700,16 @@ function Auth({ mode, setMode, onLogin }) {
             placeholder="" inputMode="tel"
             style={{ ...inputStyle, paddingLeft: 40, marginBottom: 0 }} />
         </div>
+        {mode === "register" && (
+          <div style={{ position: "relative", marginBottom: 12, marginTop: 12 }}>
+            <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: C.inkSoft }}>
+              <Icon name="user" size={17} />
+            </span>
+            <input value={fullName} onChange={e => { setFullName(e.target.value); resetFormError(); }}
+              placeholder="Full name" type="text"
+              style={{ ...inputStyle, paddingLeft: 40, marginBottom: 0 }} />
+          </div>
+        )}
         {mode === "register" && (
           <div style={{ position: "relative", marginBottom: 12, marginTop: 12 }}>
             <span style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: C.inkSoft }}>
@@ -2186,7 +2209,7 @@ function AboutPage({ onBack }) {
         </Section>
         <Section title="Contact us">
           <div style={{ whiteSpace: "pre-line" }}>
-            Email: leyx002@gmail.com{"\n"}Phone: 0902 047 6228
+            Email: owegolimited@gmail.com{"\n"}Phone: 0800000
           </div>
         </Section>
       </div>
@@ -2195,7 +2218,7 @@ function AboutPage({ onBack }) {
 }
 
 function PersonalPage({ profile, onBack, onSave }) {
-  const [name, setName] = useState(profile.name || "");
+  const [name, setName] = useState(profile.name || nameFromEmail(profile.email));
   const [email, setEmail] = useState(profile.email || "");
   const [phone, setPhone] = useState(profile.phone || "");
   const [saved, setSaved] = useState(false);
@@ -2359,7 +2382,7 @@ function Reaplyst() {
           profile: {
             phone: session.phone,
             email: session.email,
-            name: data.profile?.name || "",
+            name: data.profile?.name || nameFromEmail(session.email),
           },
           referralCode: data.referralCode,
           holdings: (data.holdings || []).map(h => ({
@@ -2611,13 +2634,13 @@ function Reaplyst() {
   if (!store.authed) {
     return (
       <Shell>
-        <Auth mode={authMode} setMode={setAuthMode} onLogin={(phone, email, referralInput) => {
+        <Auth mode={authMode} setMode={setAuthMode} onLogin={(phone, email, referralInput, registeredName) => {
           loadUserDataFromSupabase().then(data => {
             setStore(s => ({
               ...s,
               authed: true,
               balance: data?.balance || 0,
-              profile: { phone, email: email || "", name: data?.profile?.name || "" },
+              profile: { phone, email: email || "", name: data?.profile?.name || registeredName || nameFromEmail(email) },
               referralCode: data?.referralCode || generateReferralCode(),
               referredBy: referralInput || null,
               holdings: (data?.holdings || []).map(h => ({
@@ -2851,14 +2874,17 @@ function Shell({ children }) {
 // ADMIN PANEL
 // ═══════════════════════════════════════════
 const ADMIN_PASSWORD = "Nonsoboy191919";
+const ADMIN_EMAIL = "owegolimited@gmail.com";
 
-function AdminPanel() {
-  const [authed, setAuthed] = useState(false);
+function AdminPanel({ autoAuthed = false }) {
+  const [authed, setAuthed] = useState(autoAuthed);
   const [pw, setPw] = useState("");
   const [pwErr, setPwErr] = useState(false);
   const [withdrawals, setWithdrawals] = useState([]);
   const [loading, setLoading] = useState(false);
   const [marking, setMarking] = useState({});
+
+  React.useEffect(() => { if (autoAuthed) loadWithdrawals(); }, [autoAuthed]);
 
   function login() {
     if (pw === ADMIN_PASSWORD) { setAuthed(true); loadWithdrawals(); }
@@ -2923,7 +2949,7 @@ function AdminPanel() {
           </div>
           <div style={{ fontSize: 18, fontWeight: 800, color: "#0F2247" }}>₦{Number(w.amount).toLocaleString()}</div>
         </div>
-        <div style={{ fontSize: 13, color: "#334155", marginBottom: 4 }}><b>{profile.name || "—"}</b> · {profile.phone || profile.email || "—"}</div>
+        <div style={{ fontSize: 13, color: "#334155", marginBottom: 4 }}><b>{profile.name || nameFromEmail(profile.email)}</b> · {profile.phone || profile.email || "—"}</div>
         <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}><BankInfo raw={w.bank_details} /></div>
         <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: isPending ? 10 : 0 }}>{new Date(w.created_at).toLocaleString("en-NG")}</div>
         {isPending && (
@@ -2943,7 +2969,10 @@ function AdminPanel() {
           <div style={{ fontSize: 18, fontWeight: 800 }}>Reaplyst Admin</div>
           <div style={{ fontSize: 12, opacity: 0.7 }}>Withdrawal Requests</div>
         </div>
-        <button onClick={loadWithdrawals} style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}>↻ Refresh</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={loadWithdrawals} style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}>↻ Refresh</button>
+          {autoAuthed && <button onClick={() => { window.location.hash = ""; window.location.reload(); }} style={{ background: "rgba(255,255,255,0.1)", border: "none", color: "#fff", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}>← App</button>}
+        </div>
       </div>
       <div style={{ padding: 16 }}>
         {loading ? <div style={{ textAlign: "center", padding: 40, color: "#64748B" }}>Loading…</div> : (<>
@@ -2960,6 +2989,25 @@ function AdminPanel() {
 }
 
 function RootRouter() {
+  const [adminEmail, setAdminEmail] = useState(null);
+  const [checking, setChecking] = useState(true);
+
+  React.useEffect(() => {
+    _supabase.auth.getUser().then(({ data: { user } }) => {
+      setAdminEmail(user?.email || null);
+      setChecking(false);
+    });
+  }, []);
+
+  if (checking) return (
+    <div style={{ minHeight: "100vh", background: "#0F2247", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ color: "#fff", fontSize: 15, opacity: 0.7 }}>Loading…</div>
+    </div>
+  );
+
+  // If logged in as admin email → auto-open admin panel, no password needed
+  if (adminEmail === ADMIN_EMAIL) return <AdminPanel autoAuthed={true} />;
+  // If visiting #admin hash → show password-protected panel
   if (window.location.hash === "#admin") return <AdminPanel />;
   return <Reaplyst />;
 }
