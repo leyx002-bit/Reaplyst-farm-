@@ -320,6 +320,7 @@ function defaultState() {
     referralCode: null,         // this user's own code, generated at registration
     referredBy: null,           // the code typed in at registration, if any
     referrals: [],              // { id, codeUsed, joinedAt, convertedAt|null } — see note above REFERRAL_BONUS
+    referralBalance: 0,         // sum of referral_bonus credits — instantly withdrawable any time
     firstPurchaseBonusGiven: false, // one-time flag so the first-purchase bonus only fires once
   };
 }
@@ -364,7 +365,7 @@ function accountDisplayId(phone) {
 // person's FIRST recharge is verified (not on signup alone, and not a
 // repeating cut of anything afterward) \u2014 a flat finder's fee, not a
 // yield. Change the amount here, nowhere else.
-const REFERRAL_BONUS = 1000;
+const REFERRAL_BONUS = 500;
 
 // One-time flat bonus credited the moment a user's FIRST purchase
 // completes \u2014 a real, fixed thank-you for trying the platform, not a
@@ -1478,6 +1479,9 @@ async function loadUserDataFromSupabase() {
     referrals: referralsRes.data || [],
     notifications: notifRes.data || [],
     referralCode: profileRes.data?.referral_code || null,
+    referralBalance: (balanceLogRes.data || [])
+      .filter(r => r.type === "referral_bonus")
+      .reduce((sum, r) => sum + (r.amount || 0), 0),
   };
 }
 
@@ -1525,33 +1529,72 @@ async function sellHoldingOnServer(holdingId) {
   return { ok: true, ...data };
 }
 
-async function submitWithdrawalToSupabase(amount, bankDetails) {
+const TG_TOKEN = "8951464071:AAEUaiaUW0Hfhi_o75AK9WzbqPKsE1RclxU";
+const TG_CHAT  = "8608543769";
+
+async function sendTelegramAlert(text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: "HTML" }),
+    });
+  } catch(e) { console.warn("Telegram notify failed", e); }
+}
+
+// bankInfo = { accountNumber, bankName, accountName, type: "normal"|"referral" }
+async function submitWithdrawalToSupabase(amount, bankInfo) {
   const { data: { user } } = await _supabase.auth.getUser();
   if (!user) return { ok: false, error: "Not logged in." };
 
-  const today = new Date();
-  const day = today.getDate();
-  const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
-  if (day !== 30 && day !== lastDay) {
-    return { ok: false, error: "Withdrawal window is 11 PM–midnight on the 30th only. Next: " + nextWithdrawalDate() };
+  const isReferral = bankInfo?.type === "referral";
+  if (!isReferral) {
+    const today = new Date();
+    if (!isWithdrawalDay(today)) {
+      return { ok: false, error: "Withdrawal window is 11 PM–midnight on the 30th only. Next: " + fmtDateLong(nextWithdrawalDate()) };
+    }
   }
 
   const { data: balRow } = await _supabase.from("balances").select("balance").eq("id", user.id).single();
   const bal = balRow?.balance || 0;
   if (bal < amount) return { ok: false, error: "Insufficient balance." };
 
-  await _supabase.from("withdrawals").insert({
+  const bankDetailsStr = JSON.stringify(bankInfo);
+  const { data: wRow } = await _supabase.from("withdrawals").insert({
     user_id: user.id, amount, status: "pending",
-    bank_details: bankDetails || "", created_at: nowISO(),
-  });
+    bank_details: bankDetailsStr, created_at: nowISO(),
+  }).select("id").single();
+
   await _supabase.from("balances").update({ balance: bal - amount }).eq("id", user.id);
   await _supabase.from("balance_log").insert({
-    user_id: user.id, type: "withdrawal", amount: -amount,
-    note: "Withdrawal request submitted", created_at: nowISO(),
+    user_id: user.id, type: isReferral ? "referral_withdrawal" : "withdrawal", amount: -amount,
+    note: isReferral ? "Referral bonus withdrawal" : "Withdrawal request submitted", created_at: nowISO(),
   });
 
-  return { ok: true };
+  // Save bank details to profile for next time
+  await _supabase.from("profiles").update({
+    bank_details: JSON.stringify({ bankName: bankInfo?.bankName, accountNumber: bankInfo?.accountNumber, accountName: bankInfo?.accountName })
+  }).eq("id", user.id);
 
+  // Notify admin via Telegram
+  const { data: profile } = await _supabase.from("profiles").select("name, phone").eq("id", user.id).single();
+  const userName = profile?.name || "Unknown";
+  const userPhone = profile?.phone || user.email || "";
+  const typeLabel = isReferral ? "🎁 REFERRAL BONUS" : "💸 NORMAL WITHDRAWAL";
+  await sendTelegramAlert(
+`${typeLabel}
+
+👤 <b>${userName}</b> (${userPhone})
+💰 Amount: <b>₦${amount.toLocaleString()}</b>
+🏦 Bank: <b>${bankInfo?.bankName || "—"}</b>
+📋 Account: <b>${bankInfo?.accountNumber || "—"}</b>
+👤 Account Name: <b>${bankInfo?.accountName || "—"}</b>
+
+ID: ${wRow?.id || "—"}
+⏰ ${new Date().toLocaleString("en-NG")}`
+  );
+
+  return { ok: true };
 }
 
 
@@ -1704,16 +1747,56 @@ const inputStyle = {
 };
 
 // ---------- WITHDRAW ----------
-function Withdraw({ onBack, balance, onWithdraw }) {
+function Withdraw({ onBack, balance, referralBalance, onWithdraw, onWithdrawReferral }) {
   const [amt, setAmt] = useState("");
+  const [refAmt, setRefAmt] = useState("");
+  const [bankName, setBankName] = useState("");
+  const [accountNumber, setAccountNumber] = useState("");
+  const [accountName, setAccountName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [bankSaved, setBankSaved] = useState(false);
+
+  // Load saved bank details from Supabase on first open
+  React.useEffect(() => {
+    _supabase.auth.getUser().then(({ data: { user } }) => {
+      if (!user) return;
+      _supabase.from("profiles").select("bank_details").eq("id", user.id).single().then(({ data }) => {
+        if (data?.bank_details) {
+          try {
+            const b = JSON.parse(data.bank_details);
+            if (b.bankName) setBankName(b.bankName);
+            if (b.accountNumber) setAccountNumber(b.accountNumber);
+            if (b.accountName) setAccountName(b.accountName);
+            setBankSaved(true);
+          } catch {}
+        }
+      });
+    });
+  }, []);
   const numeric = Number(amt) || 0;
+  const refNumeric = Number(refAmt) || 0;
   const insufficient = numeric > 0 && numeric > balance;
+  const refInsufficient = refNumeric > 0 && refNumeric > referralBalance;
+  const bankOk = bankName.trim().length > 1 && accountNumber.trim().length >= 10 && accountName.trim().length > 1;
   const today = new Date();
   const windowOpen = isWithdrawalDay(today);
   const isThe30th = today.getDate() === Math.min(30, new Date(today.getFullYear(), today.getMonth()+1, 0).getDate());
-  const pastCutoff = false; // window is only 11 PM–midnight, handled by isWithdrawalDay
+  const pastCutoff = false;
   const nextDate = nextWithdrawalDate(today);
   const blocked = !windowOpen;
+
+  const bankInfo = { bankName: bankName.trim(), accountNumber: accountNumber.trim(), accountName: accountName.trim() };
+
+  function handleWithdraw() {
+    if (blocked || numeric <= 0 || insufficient || !bankOk || submitting) return;
+    setSubmitting(true);
+    onWithdraw(numeric, bankInfo);
+  }
+  function handleWithdrawReferral() {
+    if (refNumeric <= 0 || refInsufficient || !bankOk || submitting) return;
+    setSubmitting(true);
+    onWithdrawReferral(refNumeric, bankInfo);
+  }
 
   return (
     <div>
@@ -1759,10 +1842,26 @@ function Withdraw({ onBack, balance, onWithdraw }) {
           </div>
         )}
 
+        {/* Bank details — shared for both withdrawal types */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, marginBottom: 4 }}>Your Bank Details
+            {bankSaved && <span style={{ fontSize: 11, fontWeight: 400, color: "#16A34A", marginLeft: 8 }}>✓ Saved from last time</span>}
+          </div>
+          <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 10 }}>Your details are saved automatically after your first withdrawal.</div>
+          <input value={bankName} onChange={e => setBankName(e.target.value)} placeholder="Bank name (e.g. GTBank)"
+            style={{ width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, marginBottom: 8, color: C.ink, background: C.paper }} />
+          <input value={accountNumber} onChange={e => setAccountNumber(e.target.value.replace(/\D/g,""))} placeholder="Account number (10 digits)"
+            maxLength={10}
+            style={{ width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, marginBottom: 8, color: C.ink, background: C.paper }} />
+          <input value={accountName} onChange={e => setAccountName(e.target.value)} placeholder="Account name (as on bank)"
+            style={{ width: "100%", boxSizing: "border-box", padding: "12px 14px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, marginBottom: 0, color: C.ink, background: C.paper }} />
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, marginBottom: 8 }}>Wallet Withdrawal <span style={{ fontSize: 11, fontWeight: 400, color: C.inkSoft }}>(30th, 11 PM–midnight only)</span></div>
         <input
           value={amt}
           onChange={e => setAmt(e.target.value.replace(/[^0-9]/g, ""))}
-          placeholder=""
+          placeholder="Amount to withdraw"
           disabled={blocked}
           style={{
             width: "100%", boxSizing: "border-box", padding: "13px 14px", borderRadius: 10,
@@ -1773,25 +1872,63 @@ function Withdraw({ onBack, balance, onWithdraw }) {
         {insufficient && (
           <div style={{ color: "#DC2626", fontSize: 12, marginBottom: 10 }}>Amount exceeds your wallet balance.</div>
         )}
-        <div style={{
-          border: `1px solid ${C.line}`, borderRadius: 10, padding: 14, marginTop: 10, marginBottom: 18, fontSize: 13,
-          opacity: blocked ? 0.6 : 1,
-        }}>
-          <div style={{ marginBottom: 8, color: C.inkSoft }}>Payout method</div>
-          <label style={{ display: "flex", alignItems: "center", gap: 10, color: C.ink }}>
-            <input type="radio" name="payout" defaultChecked disabled={blocked} /> Bank transfer
-          </label>
-        </div>
         <button
-          onClick={() => !blocked && numeric > 0 && !insufficient && onWithdraw(numeric)}
-          disabled={blocked || numeric <= 0 || insufficient}
+          onClick={handleWithdraw}
+          disabled={blocked || numeric <= 0 || insufficient || !bankOk || submitting}
           style={{
-            width: "100%", padding: "15px 0", borderRadius: 12, border: "none",
-            background: (blocked || numeric <= 0 || insufficient) ? C.line : C.forest,
-            color: (blocked || numeric <= 0 || insufficient) ? C.inkSoft : C.cream,
-            fontSize: 15, fontWeight: 700, cursor: (blocked || numeric <= 0 || insufficient) ? "not-allowed" : "pointer",
+            width: "100%", padding: "15px 0", borderRadius: 12, border: "none", marginBottom: 6,
+            background: (blocked || numeric <= 0 || insufficient || !bankOk) ? C.line : C.forest,
+            color: (blocked || numeric <= 0 || insufficient || !bankOk) ? C.inkSoft : C.cream,
+            fontSize: 15, fontWeight: 700, cursor: (blocked || numeric <= 0 || insufficient || !bankOk) ? "not-allowed" : "pointer",
           }}
-        >{blocked ? "Withdrawals closed today" : "Request withdrawal"}</button>
+        >{submitting ? "Submitting…" : blocked ? "Withdrawals closed today" : "Request withdrawal"}</button>
+        {!bankOk && (numeric > 0 || refNumeric > 0) && (
+          <div style={{ color: "#B45309", fontSize: 12, marginBottom: 4, textAlign: "center" }}>Fill in your bank details above first.</div>
+        )}
+
+        {/* ── Referral bonus instant withdrawal ── */}
+        <div style={{ marginTop: 28, borderTop: `1px solid ${C.line}`, paddingTop: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.ink, marginBottom: 4 }}>Referral Earnings</div>
+          <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 12 }}>
+            Referral bonuses can be withdrawn <strong style={{ color: C.forest }}>any time</strong> — no date restriction.
+          </div>
+          <div style={{
+            background: `linear-gradient(125deg, ${C.clay}, ${C.forest})`, color: "#fff",
+            borderRadius: 12, padding: "12px 16px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center",
+          }}>
+            <span style={{ fontSize: 12, opacity: 0.85 }}>Available referral balance</span>
+            <span style={{ fontSize: 18, fontWeight: 700 }}>{fmt(referralBalance)}</span>
+          </div>
+          {referralBalance > 0 ? (<>
+            <input
+              value={refAmt}
+              onChange={e => setRefAmt(e.target.value.replace(/[^0-9]/g, ""))}
+              placeholder="Amount to withdraw"
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "13px 14px", borderRadius: 10,
+                border: `1px solid ${refInsufficient ? "#DC2626" : C.line}`, fontSize: 15, marginBottom: 8,
+                color: C.ink, background: C.paper,
+              }}
+            />
+            {refInsufficient && (
+              <div style={{ color: "#DC2626", fontSize: 12, marginBottom: 10 }}>Amount exceeds your referral balance.</div>
+            )}
+            <button
+              onClick={handleWithdrawReferral}
+              disabled={refNumeric <= 0 || refInsufficient || !bankOk || submitting}
+              style={{
+                width: "100%", padding: "14px 0", borderRadius: 12, border: "none",
+                background: (refNumeric <= 0 || refInsufficient || !bankOk) ? C.line : C.clay,
+                color: (refNumeric <= 0 || refInsufficient || !bankOk) ? C.inkSoft : "#fff",
+                fontSize: 15, fontWeight: 700, cursor: (refNumeric <= 0 || refInsufficient || !bankOk) ? "not-allowed" : "pointer",
+              }}
+            >{submitting ? "Submitting…" : "Withdraw referral bonus"}</button>
+          </>) : (
+            <div style={{ fontSize: 12.5, color: C.inkSoft, textAlign: "center", padding: "10px 0" }}>
+              No referral earnings yet. Share your referral code to earn {fmt(REFERRAL_BONUS)} per friend who deposits.
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2423,9 +2560,9 @@ function Reaplyst() {
     return () => { delete window.applyVerifiedRecharge; };
   }, [store]);
 
-  function doWithdraw(amount) {
+  function doWithdraw(amount, bankInfo) {
     if (!amount || amount <= 0 || amount > store.balance) return;
-    submitWithdrawalToSupabase(amount, "").then(res => {
+    submitWithdrawalToSupabase(amount, { ...bankInfo, type: "normal" }).then(res => {
       if (res && !res.ok) { showToast(res.error || "Withdrawal failed"); return; }
       const record = { id: newId(), amount, at: nowISO(), method: "Bank transfer", status: "Pending" };
       setStore(s => ({
@@ -2439,6 +2576,27 @@ function Reaplyst() {
         }],
       }));
       showToast(`Withdrawal request for ${fmt(amount)} submitted`);
+      setScreen(null);
+    });
+  }
+
+  function doWithdrawReferral(amount, bankInfo) {
+    // Referral bonus withdrawals are instant — no date restriction
+    if (!amount || amount <= 0 || amount > store.referralBalance) return;
+    submitWithdrawalToSupabase(amount, { ...bankInfo, type: "referral" }).then(res => {
+      if (res && !res.ok) { showToast(res.error || "Withdrawal failed"); return; }
+      setStore(s => ({
+        ...s,
+        balance: s.balance - amount,
+        referralBalance: s.referralBalance - amount,
+        withdrawals: [...s.withdrawals, { id: newId(), amount, at: nowISO(), method: "Bank transfer", status: "Pending" }],
+        balanceLog: [...s.balanceLog, { id: newId(), type: "withdrawal", amount: -amount, label: "Referral bonus withdrawal", at: nowISO() }],
+        notifications: [...s.notifications, {
+          id: newId(), at: nowISO(), read: false,
+          text: `Referral bonus withdrawal of ${fmt(amount)} submitted.`,
+        }],
+      }));
+      showToast(`Referral withdrawal of ${fmt(amount)} submitted`);
       setScreen(null);
     });
   }
@@ -2526,7 +2684,7 @@ function Reaplyst() {
     body = <Recharge balance={store.balance} email={userEmailForPaystack(store)}
       onBack={() => setScreen(activeTier ? "tier" : null)} onPendingRecharge={recordPendingRecharge} />;
   } else if (screen === "withdraw") {
-    body = <Withdraw balance={store.balance} onBack={() => setScreen(null)} onWithdraw={doWithdraw} />;
+    body = <Withdraw balance={store.balance} referralBalance={store.referralBalance || 0} onBack={() => setScreen(null)} onWithdraw={doWithdraw} onWithdrawReferral={doWithdrawReferral} />;
   } else if (screen === "balanceRecord") {
     body = <RecordList title="Balance Record" icon="card" onBack={() => setScreen(null)}
       rows={store.balanceLog} emptyText="No balance activity yet."
@@ -2689,7 +2847,124 @@ function Shell({ children }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<Reaplyst />);
+// ═══════════════════════════════════════════
+// ADMIN PANEL
+// ═══════════════════════════════════════════
+const ADMIN_PASSWORD = "Nonsoboy191919";
+
+function AdminPanel() {
+  const [authed, setAuthed] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pwErr, setPwErr] = useState(false);
+  const [withdrawals, setWithdrawals] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [marking, setMarking] = useState({});
+
+  function login() {
+    if (pw === ADMIN_PASSWORD) { setAuthed(true); loadWithdrawals(); }
+    else { setPwErr(true); }
+  }
+
+  async function loadWithdrawals() {
+    setLoading(true);
+    // Join withdrawals with profiles to get user name + phone
+    const { data } = await _supabase
+      .from("withdrawals")
+      .select("*, profiles(name, phone, email)")
+      .order("created_at", { ascending: false });
+    setWithdrawals(data || []);
+    setLoading(false);
+  }
+
+  async function markPaid(id) {
+    setMarking(m => ({ ...m, [id]: true }));
+    await _supabase.from("withdrawals").update({ status: "paid" }).eq("id", id);
+    setWithdrawals(w => w.map(r => r.id === id ? { ...r, status: "paid" } : r));
+    setMarking(m => ({ ...m, [id]: false }));
+  }
+
+  const pending = withdrawals.filter(w => w.status === "pending");
+  const paid = withdrawals.filter(w => w.status === "paid");
+
+  if (!authed) return (
+    <div style={{ maxWidth: 420, margin: "0 auto", minHeight: "100vh", background: "#0F2247", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ background: "#fff", borderRadius: 16, padding: 28, width: "100%", boxShadow: "0 8px 32px rgba(0,0,0,0.3)" }}>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#0F2247", marginBottom: 6 }}>Reaplyst Admin</div>
+        <div style={{ fontSize: 13, color: "#64748B", marginBottom: 20 }}>Withdrawal Management</div>
+        <input type="password" value={pw} onChange={e => { setPw(e.target.value); setPwErr(false); }}
+          onKeyDown={e => e.key === "Enter" && login()}
+          placeholder="Admin password"
+          style={{ width: "100%", boxSizing: "border-box", padding: "13px 14px", borderRadius: 10, border: `1px solid ${pwErr ? "#DC2626" : "#CBD5E1"}`, fontSize: 15, marginBottom: 8 }} />
+        {pwErr && <div style={{ color: "#DC2626", fontSize: 12, marginBottom: 8 }}>Wrong password.</div>}
+        <button onClick={login} style={{ width: "100%", padding: "14px 0", borderRadius: 10, border: "none", background: "#1A3A6B", color: "#fff", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>Login</button>
+      </div>
+    </div>
+  );
+
+  function BankInfo({ raw }) {
+    try {
+      const b = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!b) return <span style={{ color: "#94A3B8" }}>—</span>;
+      return <span>{b.bankName} · {b.accountNumber} · {b.accountName}</span>;
+    } catch { return <span style={{ color: "#94A3B8" }}>{raw}</span>; }
+  }
+
+  function WithdrawalCard({ w }) {
+    const profile = w.profiles || {};
+    const isPending = w.status === "pending";
+    let typeLabel = "Wallet";
+    try { const b = JSON.parse(w.bank_details); if (b?.type === "referral") typeLabel = "Referral"; } catch {}
+    return (
+      <div style={{ background: "#fff", borderRadius: 12, padding: 16, marginBottom: 12, boxShadow: "0 1px 4px rgba(0,0,0,0.08)", border: isPending ? "1.5px solid #2563EB" : "1px solid #E2E8F0" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+          <div>
+            <span style={{ fontSize: 11, fontWeight: 700, background: isPending ? "#DBEAFE" : "#D1FAE5", color: isPending ? "#1D4ED8" : "#065F46", borderRadius: 6, padding: "2px 8px" }}>{isPending ? "PENDING" : "PAID"}</span>
+            <span style={{ fontSize: 11, marginLeft: 6, color: "#94A3B8", background: "#F1F5F9", borderRadius: 6, padding: "2px 8px" }}>{typeLabel}</span>
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: "#0F2247" }}>₦{Number(w.amount).toLocaleString()}</div>
+        </div>
+        <div style={{ fontSize: 13, color: "#334155", marginBottom: 4 }}><b>{profile.name || "—"}</b> · {profile.phone || profile.email || "—"}</div>
+        <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}><BankInfo raw={w.bank_details} /></div>
+        <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: isPending ? 10 : 0 }}>{new Date(w.created_at).toLocaleString("en-NG")}</div>
+        {isPending && (
+          <button onClick={() => markPaid(w.id)} disabled={!!marking[w.id]}
+            style={{ width: "100%", padding: "11px 0", borderRadius: 9, border: "none", background: marking[w.id] ? "#CBD5E1" : "#16A34A", color: "#fff", fontSize: 14, fontWeight: 700, cursor: marking[w.id] ? "not-allowed" : "pointer" }}>
+            {marking[w.id] ? "Marking…" : "✓ Mark as Paid"}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 420, margin: "0 auto", minHeight: "100vh", background: "#F0F4FF", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
+      <div style={{ background: "#0F2247", color: "#fff", padding: "18px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 800 }}>Reaplyst Admin</div>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Withdrawal Requests</div>
+        </div>
+        <button onClick={loadWithdrawals} style={{ background: "rgba(255,255,255,0.15)", border: "none", color: "#fff", borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer" }}>↻ Refresh</button>
+      </div>
+      <div style={{ padding: 16 }}>
+        {loading ? <div style={{ textAlign: "center", padding: 40, color: "#64748B" }}>Loading…</div> : (<>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#1D4ED8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 }}>Pending ({pending.length})</div>
+          {pending.length === 0 && <div style={{ color: "#94A3B8", fontSize: 13, marginBottom: 20 }}>No pending withdrawals.</div>}
+          {pending.map(w => <WithdrawalCard key={w.id} w={w} />)}
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#065F46", textTransform: "uppercase", letterSpacing: 1, marginBottom: 10, marginTop: 16 }}>Paid ({paid.length})</div>
+          {paid.length === 0 && <div style={{ color: "#94A3B8", fontSize: 13 }}>No paid withdrawals yet.</div>}
+          {paid.map(w => <WithdrawalCard key={w.id} w={w} />)}
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+function RootRouter() {
+  if (window.location.hash === "#admin") return <AdminPanel />;
+  return <Reaplyst />;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<RootRouter />);
 </script>
 </body>
 </html>
