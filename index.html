@@ -1100,7 +1100,7 @@ function openPaystackCheckout({ email, amountKobo, reference, onSuccess, onClose
 }
 
 function Recharge({ onBack, balance, email, onPendingRecharge }) {
-  const MIN_RECHARGE = 2000;
+  const MIN_RECHARGE = 1000;
   const [amt, setAmt] = useState(150000);
   const [raw, setRaw] = useState(String(150000));
   const [stage, setStage] = useState("idle"); // idle | opening | pending
